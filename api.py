@@ -1,9 +1,3 @@
-﻿"""Минимальный клиент Telegram Bot API.
-
-Только стандартная библиотека: ни requests, ни aiogram не нужны.
-Умеет: long polling, повторы при 429/5xx/сетевых сбоях, разбор ошибок API.
-"""
-
 from __future__ import annotations
 
 import json
@@ -15,9 +9,7 @@ import urllib.request
 
 log = logging.getLogger(__name__)
 
-
 class TelegramError(RuntimeError):
-    """Ошибка вызова метода Bot API."""
 
     def __init__(
         self,
@@ -32,7 +24,6 @@ class TelegramError(RuntimeError):
         self.code = code
         self.retry_after = retry_after
 
-
 def _decode(raw: bytes) -> dict:
     try:
         payload = json.loads(raw.decode("utf-8", "replace"))
@@ -40,16 +31,13 @@ def _decode(raw: bytes) -> dict:
         return {}
     return payload if isinstance(payload, dict) else {}
 
-
 def _retry_after(payload: dict) -> int | None:
     params = payload.get("parameters")
     if isinstance(params, dict) and isinstance(params.get("retry_after"), int):
         return max(1, min(params["retry_after"], 60))
     return None
 
-
 class TelegramAPI:
-    """Тонкая обёртка над https://api.telegram.org/bot<token>/<method>."""
 
     RETRY_HTTP = frozenset({429, 500, 502, 503, 504})
 
@@ -71,7 +59,6 @@ class TelegramAPI:
             handlers = [urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})]
             self._opener = urllib.request.build_opener(*handlers)
 
-    # ------------------------------------------------------------------ core
     def _open(self, request: urllib.request.Request, timeout: float):
         if self._opener is not None:
             return self._opener.open(request, timeout=timeout)
@@ -136,10 +123,8 @@ class TelegramAPI:
         raise TelegramError(method, "исчерпаны попытки повтора")
 
     def call(self, method: str, **params):
-        """Вызов любого метода Bot API. Параметры уходят в JSON-теле."""
         return self._request(method, params, self.timeout)
 
-    # ------------------------------------------------------------- helpers
     def get_me(self) -> dict:
         return self.call("getMe") or {}
 
@@ -147,7 +132,7 @@ class TelegramAPI:
         params = {"offset": offset, "timeout": timeout, "limit": 100}
         if allowed_updates:
             params["allowed_updates"] = list(allowed_updates)
-        # HTTP-таймаут должен быть заметно больше long-poll таймаута.
+
         return self._request("getUpdates", params, request_timeout=timeout + 25) or []
 
     def set_my_commands(self, commands) -> bool:

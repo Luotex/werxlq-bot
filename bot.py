@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Точка входа Telegram-бота приёма заявок.
-
-Запуск:
-    python bot.py            # обычный режим (long polling)
-    python bot.py --check    # проверить настройки и выйти
-    python bot.py --demo     # показать сценарий без Telegram
-
-Только стандартная библиотека Python 3.9+.
-"""
 
 from __future__ import annotations
 
@@ -26,9 +17,9 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from api import TelegramAPI, TelegramError  # noqa: E402
-from logic import BotLogic, Config  # noqa: E402
-from store import Store  # noqa: E402
+from api import TelegramAPI, TelegramError
+from logic import BotLogic, Config
+from store import VERSION, Store
 
 TOKEN_RE = re.compile(r"^\d{5,15}:[A-Za-z0-9_-]{20,}$")
 ALLOWED_UPDATES = ["message", "callback_query"]
@@ -36,21 +27,14 @@ BOT_COMMANDS = [
     {"command": "start", "description": "Начать"},
     {"command": "pay", "description": "Купить сигну"},
     {"command": "status", "description": "Статус заявки"},
+    {"command": "cancel", "description": "Отменить заявку"},
 ]
 
 log = logging.getLogger("bot")
 
-# Видно в логах при старте — помогает понять, какой код реально крутится на сервере.
-BUILD = "2026-11-14 · заявки кнопками в /orders, отмена, /help"
+BUILD = "2026-11-24 · статус и отмена в меню, доказательства и история для оператора, очистка памяти"
 
-
-# ------------------------------------------------------------------ окружение
 def load_env_file(path: Path) -> None:
-    """Простейший .env: KEY=VALUE, без зависимостей. Уже заданные переменные не трогаем.
-
-    Читает UTF-8 (в том числе с BOM), а если файл сохранён Блокнотом в cp1251 —
-    прочитает и его. Это важно: иначе русские значения вроде «Арина Е.» ломали бы запуск.
-    """
     if not path.exists():
         return
     try:
@@ -81,10 +65,8 @@ def load_env_file(path: Path) -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
-
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
-
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -92,10 +74,8 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
-
 def get_token() -> str:
     return _env("TELEGRAM_BOT_TOKEN") or _env("BOT_TOKEN")
-
 
 def build_config() -> Config:
     admin_ids: list[int] = []
@@ -130,22 +110,20 @@ def build_config() -> Config:
         support_contact=_env("SUPPORT_CONTACT"),
         rate_limit_count=_env_int("RATE_LIMIT_COUNT", 20),
         rate_limit_window=_env_int("RATE_LIMIT_WINDOW", 60),
+        keep_closed=_env_int("KEEP_CLOSED", 25),
     )
 
-
 def get_proxy() -> str:
-    """Прокси для api.telegram.org, если прямой доступ закрыт."""
     for name in ("TELEGRAM_PROXY", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
         value = _env(name)
         if value:
             return value
     return ""
 
-
 def setup_logging(verbose: bool, log_file: Path | None) -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+            stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
 
@@ -168,7 +146,6 @@ def setup_logging(verbose: bool, log_file: Path | None) -> None:
     )
     logging.getLogger("urllib").setLevel(logging.WARNING)
 
-
 def mask_token(token: str) -> str:
     if not token:
         return "—"
@@ -176,13 +153,9 @@ def mask_token(token: str) -> str:
         return token[:3] + "…"
     return f"{token[:10]}…{token[-4:]}"
 
-
 def operator_list(cfg: Config) -> str:
-    """Список операторов в том виде, как его вписали в .env."""
     return ", ".join(f"@{name}" for name in [cfg.admin_username, *cfg.admin_usernames])
 
-
-# ------------------------------------------------------------------- проверка
 def run_check(cfg: Config, token: str, data_dir: Path) -> int:
     problems = 0
     print("Проверка настроек\n" + "-" * 40)
@@ -229,10 +202,7 @@ def run_check(cfg: Config, token: str, data_dir: Path) -> int:
     print("Готово к запуску." if problems == 0 else "Исправь ошибки выше.")
     return 0 if problems == 0 else 2
 
-
-# ------------------------------------------------------------- сеть/диагностика
 def run_net_check(token: str) -> int:
-    """Пошагово проверяет DNS → TCP → HTTPS. Помогает отличить блокировку от кривого токена."""
     host = "api.telegram.org"
     print("Проверка сети до Telegram\n" + "-" * 40)
 
@@ -293,8 +263,6 @@ def run_net_check(token: str) -> int:
     print("Сеть в порядке — бот готов работать.")
     return 0
 
-
-# ------------------------------------------------------------------ long poll
 def run_polling(api: TelegramAPI, logic: BotLogic, store: Store, cfg: Config, poll_timeout: int) -> int:
     offset = int(store.data.get("offset") or 0)
     log.info("Версия кода: %s", BUILD)
@@ -334,8 +302,6 @@ def run_polling(api: TelegramAPI, logic: BotLogic, store: Store, cfg: Config, po
         if updates:
             store.save()
 
-
-# ----------------------------------------------------------------------- main
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Telegram-бот: заявки на оплату уходят операторам (@werxlq, @Luotx)"
@@ -354,19 +320,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reset-data", action="store_true", help="очистить заявки и счётчик и выйти")
     return parser.parse_args(argv)
 
-
 def _truthy(value: str) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on", "да")
 
-
 def reset_data_if_requested(data_dir: Path, force: bool = False) -> bool:
-    """Очистка заявок и счётчика по запросу.
-
-    Сохраняет список операторов и позицию в очереди Telegram, чтобы после сброса
-    никому не пришлось заново нажимать /start и старые сообщения не переигрались.
-    Срабатывает один раз: после сброса кладётся маркер .reset_done, поэтому
-    включённая переменная RESET_DATA не стирает данные при каждом старте.
-    """
     if not (force or _truthy(_env("RESET_DATA"))):
         return False
 
@@ -389,11 +346,13 @@ def reset_data_if_requested(data_dir: Path, force: bool = False) -> bool:
             print(f"Старое состояние не прочитано ({exc}), начинаю с чистого листа", file=sys.stderr)
 
     fresh = {
-        "version": 1,
+        "version": VERSION,
         "offset": offset,
         "admins": admins,
         "sessions": {},
         "orders": {},
+        "closed": {},
+        "totals": {"closed": 0, "accepted": 0, "rejected": 0, "cancelled": 0},
         "msgmap": {},
         "counter": 1,
     }
@@ -404,20 +363,17 @@ def reset_data_if_requested(data_dir: Path, force: bool = False) -> bool:
         print(f"Не удалось сбросить данные: {exc}", file=sys.stderr)
         return False
 
-    print("RESET_DATA: заявки очищены, нумерация начнётся с #1. Операторы сохранены.")
+    print("RESET_DATA: заявки и история очищены, нумерация начнётся с #1. Операторы сохранены.")
     return True
-
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     load_env_file(Path(args.env))
 
-    # Каталог данных: --data-dir, затем $DATA_DIR, затем ./data рядом с ботом.
-    # Нужно для хостингов, где рабочая папка доступна только на чтение.
     data_dir = Path(args.data_dir or _env("DATA_DIR") or (BASE_DIR / "data"))
 
     if args.demo:
-        import demo  # локальный модуль
+        import demo
 
         return demo.main()
 
@@ -455,7 +411,6 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Остановлено пользователем.")
         store.save()
         return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,19 +1,3 @@
-"""Вся логика бота: заявки, выдача материала, переписка с покупателем.
-
-Класс BotLogic ничего не знает про сеть — он получает объект API с методом call(),
-поэтому его можно гонять офлайн в тестах и в демо-режиме.
-
-Сценарий покупателя:
-    /start → «Это бот для сигн от Вельвет»
-    «Купить сигну» → ник → реквизиты и оплата → подтверждение (фото/текст) → заявка
-
-Оператор:
-    карточка заявки → «Подтвердить» → фото с подписью уходит покупателю
-    «✍️ Написать по заявке» → переписка; ответы покупателя реплаем возвращаются оператору
-
-Посторонние сообщения покупателей оператору не пересылаются.
-"""
-
 from __future__ import annotations
 
 import html
@@ -33,7 +17,11 @@ CARD_RE = re.compile(r"\d(?:[ \-]?\d){12,18}")
 
 BUYER_PROOF_KINDS = {"photo", "document", "video", "text"}
 PRODUCT_KINDS = {"photo", "document"}
+ATTACHMENT_KINDS = {"photo", "document", "video"}
 
+MAX_PROOFS = 5
+MAX_MSGMAP = 300
+MAX_CHAT_HISTORY = 20
 
 @dataclass
 class Config:
@@ -53,17 +41,16 @@ class Config:
     support_contact: str = ""
     rate_limit_count: int = 20
     rate_limit_window: int = 60
+    keep_closed: int = 25
 
     @property
     def all_admin_usernames(self) -> list[str]:
-        """Все операторы: основной + дополнительные (без @, в нижнем регистре)."""
         result: list[str] = []
         for name in [self.admin_username, *self.admin_usernames]:
             clean = (name or "").strip().lstrip("@").lower()
             if clean and clean not in result:
                 result.append(clean)
         return result
-
 
 def luhn(digits: str) -> bool:
     total = 0
@@ -76,9 +63,7 @@ def luhn(digits: str) -> bool:
         total += value
     return total % 10 == 0
 
-
 def looks_like_card(text: str, seller_digits: str = "") -> bool:
-    """Ищем в тексте номер чужой банковской карты (по алгоритму Луна)."""
     for match in CARD_RE.finditer(text or ""):
         digits = re.sub(r"\D", "", match.group(0))
         if not 13 <= len(digits) <= 19:
@@ -89,7 +74,6 @@ def looks_like_card(text: str, seller_digits: str = "") -> bool:
             return True
     return False
 
-
 class BotLogic:
     def __init__(self, api, store: Store, cfg: Config, strict: bool = False) -> None:
         self.api = api
@@ -99,7 +83,6 @@ class BotLogic:
         self._hits: dict[int, list[float]] = {}
         self._seller_digits = re.sub(r"\D", "", cfg.card_number or "")
 
-    # ----------------------------------------------------------- утилиты
     @property
     def data(self) -> dict:
         return self.store.data
@@ -145,11 +128,44 @@ class BotLogic:
         self.store.sessions.pop(str(chat_id), None)
 
     def _remember_buyer(self, buyer_chat: int, result, order_id: str) -> None:
-        """Запоминаем сообщение, отправленное покупателю, чтобы работал reply."""
         if isinstance(result, dict) and result.get("message_id"):
             self.data["msgmap"][f"{buyer_chat}:{result['message_id']}"] = {
                 "order_id": order_id,
             }
+            self._trim_msgmap()
+
+    def _trim_msgmap(self) -> None:
+        msgmap = self.data.get("msgmap") or {}
+        overflow = len(msgmap) - MAX_MSGMAP
+        if overflow <= 0:
+            return
+        for key in list(msgmap)[:overflow]:
+            msgmap.pop(key, None)
+
+    def _find_order(self, order_id: str) -> dict | None:
+        if not order_id:
+            return None
+        order = self.store.orders.get(str(order_id))
+        if isinstance(order, dict):
+            return order
+        closed = self.store.closed.get(str(order_id))
+        return closed if isinstance(closed, dict) else None
+
+    @staticmethod
+    def _proofs(order: dict) -> list[dict]:
+        proofs = order.get("proofs")
+        if isinstance(proofs, list) and proofs:
+            return [item for item in proofs if isinstance(item, dict)]
+        proof = order.get("proof")
+        return [proof] if isinstance(proof, dict) else []
+
+    def _orders_of_user(self, user_id) -> list[dict]:
+        result: list[dict] = []
+        for source in (self.store.orders, self.store.closed):
+            for order in source.values():
+                if isinstance(order, dict) and order.get("user_id") == user_id:
+                    result.append(order)
+        return result
 
     def _rate_limited(self, user_id: int) -> bool:
         limit, window = self.cfg.rate_limit_count, self.cfg.rate_limit_window
@@ -161,7 +177,6 @@ class BotLogic:
         self._hits[user_id] = hits
         return len(hits) > limit
 
-    # ------------------------------------------------------------- админы
     def _is_admin(self, user: dict) -> bool:
         user_id = user.get("id")
         if user_id in self.cfg.admin_ids:
@@ -189,7 +204,6 @@ class BotLogic:
                 result.append(chat_id)
         return result
 
-    # ------------------------------------------------------------- dispatch
     def handle_update(self, update: dict) -> None:
         try:
             if "callback_query" in update:
@@ -200,7 +214,7 @@ class BotLogic:
             if self.strict:
                 raise
             log.warning("Ошибка Telegram API при обработке обновления: %s", exc)
-        except Exception:  # noqa: BLE001 — бот не должен падать от одного апдейта
+        except Exception:
             if self.strict:
                 raise
             log.exception("Необработанная ошибка в обновлении %s", update.get("update_id"))
@@ -230,7 +244,6 @@ class BotLogic:
 
         self._on_buyer_message(msg, text)
 
-    # ------------------------------------------------------------- покупатель
     def _on_buyer_command(self, chat_id: int, user: dict, command: str) -> None:
         if command == "start":
             self._clear_session(chat_id)
@@ -254,35 +267,57 @@ class BotLogic:
         self._send(chat_id, T.welcome(self.cfg, user.get("first_name")), T.welcome_keyboard())
 
     def _cancel_buyer(self, chat_id: int, user: dict) -> None:
-        """Отмена покупателем: черновик сбрасываем, отправленную заявку — закрываем."""
         session = self._session(chat_id)
         step = session.get("step")
         order_id = session.get("order_id")
-        order = self.store.orders.get(order_id) if order_id else None
+        order = self._find_order(order_id) if order_id else None
 
         if step == "sent" and isinstance(order, dict):
-            status = order.get("status")
-
-            if status == "pending":
-                # Заявка ещё не в работе — отменяем по-настоящему и сообщаем операторам.
-                self._clear_session(chat_id)
-                self._set_status(order, "cancelled", final=True)
-                self._send(chat_id, T.buyer_cancelled(self.cfg, order["id"]), T.back_keyboard())
-                self._notify_cancelled(order)
-                self._save()
-                return
-
-            if status == "awaiting_product":
-                self._send(chat_id, T.cancel_too_late(self.cfg, order["id"]))
-                return
-
-            self._clear_session(chat_id)
-            self._send(chat_id, T.already_closed(self.cfg, order["id"]), T.back_keyboard())
+            self._close_or_refuse(order, chat_id)
             return
 
-        # Черновик (ник/чек) — просто сбрасываем, оператор о нём не знает.
         self._clear_session(chat_id)
-        self._send(chat_id, T.cancelled())
+        if step in ("nick", "proof", "confirm"):
+            self._send(chat_id, T.cancelled(), T.back_keyboard())
+            self._save()
+            return
+
+        active = self._live_orders_of(user.get("id"))
+        pending = [item for item in active if item.get("status") == "pending"]
+        if pending:
+            self._close_or_refuse(max(pending, key=lambda item: item.get("created_at") or 0), chat_id)
+            return
+        if active:
+            self._send(chat_id, T.cancel_too_late(self.cfg, active[0].get("id")))
+            return
+
+        self._send(chat_id, T.nothing_to_cancel(self.cfg), T.back_keyboard())
+        self._save()
+
+    def _live_orders_of(self, user_id) -> list[dict]:
+        return [
+            order
+            for order in self.store.orders.values()
+            if isinstance(order, dict) and order.get("user_id") == user_id
+        ]
+
+    def _close_or_refuse(self, order: dict, chat_id: int) -> None:
+        status = order.get("status")
+        order_id = order.get("id")
+
+        if status == "pending":
+            self._clear_session(chat_id)
+            self._finalize(order, "cancelled")
+            self._send(chat_id, T.buyer_cancelled(self.cfg, order_id), T.back_keyboard())
+            self._notify_cancelled(order)
+            return
+
+        if status == "awaiting_product":
+            self._send(chat_id, T.cancel_too_late(self.cfg, order_id))
+            return
+
+        self._clear_session(chat_id)
+        self._send(chat_id, T.already_closed(self.cfg, order_id), T.back_keyboard())
         self._save()
 
     def _notify_cancelled(self, order: dict) -> None:
@@ -301,10 +336,13 @@ class BotLogic:
             self._take_proof(chat_id, msg)
             return
         if step == "confirm":
+            proof = self._extract_proof(msg)
+            if proof and proof.get("kind") in ATTACHMENT_KINDS and proof.get("file_id"):
+                self._add_proof(chat_id, proof)
+                return
             self._send(chat_id, T.confirm_reminder(), T.preview_keyboard())
             return
 
-        # Ответ реплаем на сообщение оператора по заявке — передаём оператору.
         reply = msg.get("reply_to_message") or {}
         if reply.get("message_id"):
             record = self.data["msgmap"].get(f"{chat_id}:{reply['message_id']}")
@@ -312,7 +350,6 @@ class BotLogic:
                 self._relay_buyer_reply(msg, record.get("order_id", ""))
                 return
 
-        # Всё остальное оператору не уходит — только подсказка.
         self._send(chat_id, T.outside_flow_hint(self.cfg), T.back_keyboard())
 
     def _start_order(self, chat_id: int, user: dict) -> None:
@@ -336,7 +373,7 @@ class BotLogic:
             return
         if self._guard_card(chat_id, nick):
             return
-        # Шаг 2: показываем реквизиты и ждём подтверждение оплаты.
+
         self._set_session(chat_id, step="proof", nick=nick)
         self._send(chat_id, T.payment_step(self.cfg), [[T.btn("✖️ Отмена", "cancel")]])
         self._save()
@@ -369,33 +406,55 @@ class BotLogic:
             return
         if proof.get("kind") == "text" and self._guard_card(chat_id, proof.get("text", "")):
             return
-        if proof.get("kind") in ("photo", "document", "video") and not proof.get("file_id"):
+        if proof.get("kind") in ATTACHMENT_KINDS and not proof.get("file_id"):
             self._send(chat_id, T.proof_required())
             return
 
-        self._set_session(chat_id, step="confirm", proof=proof)
+        self._set_session(chat_id, step="confirm", proof=proof, proofs=[proof])
+        self._show_preview(chat_id)
+        self._save()
+
+    def _show_preview(self, chat_id: int, prefix: str = "") -> None:
         session = self._session(chat_id)
-        self._send(
-            chat_id,
-            T.preview(self.cfg, session.get("nick", ""), proof),
-            T.preview_keyboard(),
-        )
+        proofs = session.get("proofs") or [session.get("proof") or {}]
+        text = T.preview(self.cfg, session.get("nick", ""), proofs[0], len(proofs))
+        self._send(chat_id, (prefix + "\n\n" if prefix else "") + text, T.preview_keyboard())
+
+    def _add_proof(self, chat_id: int, proof: dict) -> None:
+        session = self._session(chat_id)
+        proofs = [item for item in session.get("proofs") or [] if isinstance(item, dict)]
+        if len(proofs) >= MAX_PROOFS:
+            self._send(chat_id, T.proof_limit(MAX_PROOFS), T.preview_keyboard())
+            return
+        proofs.append(proof)
+        session["proofs"] = proofs
+        session["proof"] = proofs[0]
+        self._show_preview(chat_id, T.proof_added(len(proofs)))
         self._save()
 
     def _send_status(self, chat_id: int, user: dict) -> None:
-        orders = [
-            order
-            for order in self.store.orders.values()
-            if isinstance(order, dict) and order.get("user_id") == user.get("id")
-        ]
+        orders = self._orders_of_user(user.get("id"))
         if not orders:
-            self._send(chat_id, T.no_orders_yet())
+            self._send(chat_id, T.no_orders_yet(), T.back_keyboard())
             return
-        orders.sort(key=lambda item: item.get("created_at", 0), reverse=True)
+        orders.sort(
+            key=lambda item: item.get("updated_at") or item.get("created_at") or 0,
+            reverse=True,
+        )
         latest = orders[0]
-        self._send(chat_id, T.status_text(self.cfg, latest, self._fmt_time(latest.get("created_at", 0))))
+        updated = self._fmt_time(latest["updated_at"]) if latest.get("updated_at") else ""
+        self._send(
+            chat_id,
+            T.status_text(
+                self.cfg,
+                latest,
+                self._fmt_time(latest.get("created_at", 0)),
+                updated,
+                len(orders),
+            ),
+            T.status_keyboard(latest),
+        )
 
-    # --------------------------------------------------------------- заявка
     def _submit(self, chat_id: int, user: dict) -> None:
         session = self._session(chat_id)
         if session.get("step") != "confirm" or not session.get("proof"):
@@ -403,6 +462,11 @@ class BotLogic:
             return
 
         order_id = self.store.next_order_id()
+        proofs = [
+            item
+            for item in (session.get("proofs") or [session.get("proof")])
+            if isinstance(item, dict)
+        ]
         order = {
             "id": order_id,
             "user_id": user.get("id"),
@@ -410,7 +474,8 @@ class BotLogic:
             "username": user.get("username") or "",
             "name": user.get("first_name") or "",
             "nick": session.get("nick", ""),
-            "proof": session["proof"],
+            "proof": proofs[0],
+            "proofs": proofs,
             "status": "pending",
             "created_at": self._now(),
             "admin_msgs": [],
@@ -474,6 +539,7 @@ class BotLogic:
             return False
 
         keyboard = T.order_keyboard(order["id"])
+        proofs = self._proofs(order)
         delivered = False
         for chat_id in admins:
             try:
@@ -481,16 +547,16 @@ class BotLogic:
                 if isinstance(result, dict) and result.get("message_id"):
                     order["admin_msgs"].append([chat_id, result["message_id"]])
 
-                self._deliver_proof(
-                    chat_id, order.get("proof") or {}, T.proof_caption(order["id"])
-                )
+                for index, proof in enumerate(proofs):
+                    self._deliver_proof(
+                        chat_id, proof, T.proof_caption(order["id"], index, len(proofs))
+                    )
                 delivered = True
             except TelegramError as exc:
                 log.warning("Оператор %s недоступен: %s", chat_id, exc)
         self._save()
         return delivered
 
-    # ----------------------------------------------------------- действия
     def _on_callback(self, callback: dict) -> None:
         user = callback.get("from") or {}
         data = callback.get("data") or ""
@@ -511,26 +577,44 @@ class BotLogic:
         if data == "info":
             self._send(chat_id, T.info_text(self.cfg), T.back_keyboard())
             return
+        if data == "status":
+            self._send_status(chat_id, user)
+            return
         if data == "cancel":
-            if self._is_admin(user) and self._session(chat_id).get("step") in ("product", "chat"):
+            if self._is_admin(user):
                 self._cancel_admin_step(chat_id)
                 return
-            self._clear_session(chat_id)
-            self._send(chat_id, T.cancelled())
+            self._cancel_buyer(chat_id, user)
             return
         if data == "confirm":
             self._submit(chat_id, user)
             return
-        if data == "orders":
+        if data in ("orders", "history", "stats", "link"):
             if not self._is_admin(user):
                 self._send(chat_id, T.admins_only())
                 return
-            self._send_pending(chat_id)
+            if data == "orders":
+                self._send_pending(chat_id)
+            elif data == "history":
+                self._send_history(chat_id)
+            elif data == "stats":
+                self._send(
+                    chat_id,
+                    T.stats_text(self.cfg, self.store.stats(), self._admin_chat_ids()),
+                )
+            else:
+                self._send(chat_id, T.link_text(self.cfg))
             return
 
         action, _, order_id = data.partition(":")
         if action in ("acc", "rej", "unacc", "chat") and order_id:
             self._admin_action(action, order_id, user, chat_id)
+            return
+        if action == "proof" and order_id:
+            if not self._is_admin(user):
+                self._send(chat_id, T.admins_only())
+                return
+            self._send_proof_to(chat_id, order_id)
             return
 
         log.debug("Неизвестный callback: %s", data)
@@ -540,7 +624,7 @@ class BotLogic:
             self._send(chat_id, T.admins_only())
             return
 
-        order = self.store.orders.get(order_id)
+        order = self._find_order(order_id)
         if not isinstance(order, dict):
             self._send(chat_id, T.order_missing(order_id))
             return
@@ -563,10 +647,14 @@ class BotLogic:
             if order.get("status") == "rejected":
                 self._send(chat_id, T.already_rejected(order_id))
                 return
+            if order.get("status") in ("cancelled", "accepted"):
+                self._send(chat_id, T.already_closed(self.cfg, order_id))
+                return
             self._clear_session(chat_id)
-            self._set_status(order, "rejected", final=True)
+            self._finalize(order, "rejected")
             self._try_send(order["chat_id"], T.buyer_rejected(self.cfg, order_id))
             self._send(chat_id, f"❌ Заявка #{order_id} отклонена. Покупатель уведомлён.")
+            return
         elif action == "unacc":
             if order.get("status") != "awaiting_product":
                 self._send(chat_id, "Эту заявку уже нельзя вернуть в ожидание.")
@@ -574,7 +662,7 @@ class BotLogic:
             self._clear_session(chat_id)
             self._set_status(order, "pending")
             self._send(chat_id, T.order_cancelled_accept(order_id))
-        else:  # chat — переписка по заявке
+        else:
             self._set_session(chat_id, step="chat", order_id=order_id)
             self._send(chat_id, T.ask_chat_message(order_id), [[T.btn("✖️ Закончить", "cancel")]])
         self._save()
@@ -602,7 +690,58 @@ class BotLogic:
             except TelegramError as exc:
                 log.debug("Не удалось обновить карточку заявки #%s: %s", order.get("id"), exc)
 
-    # ------------------------------------------------------------- оператор
+    def _finalize(self, order: dict, status: str) -> None:
+        order_id = str(order.get("id"))
+        self._set_status(order, status, final=True)
+        order["status"] = status
+        kept = self.store.archive(order, keep=self.cfg.keep_closed)
+        self.store.clear_sessions_for(order_id)
+        log.info(
+            "Заявка #%s закрыта (%s): карточка удалена, история %s/%s, переписка %s",
+            order_id,
+            status,
+            len(self.store.closed),
+            self.cfg.keep_closed,
+            "оставлена" if kept else "удалена",
+        )
+        self._save()
+
+    def _history_rows(self) -> list[dict]:
+        items = [item for item in self.store.closed.values() if isinstance(item, dict)]
+        items.sort(
+            key=lambda item: item.get("updated_at") or item.get("created_at") or 0,
+            reverse=True,
+        )
+        return [
+            {
+                "id": item.get("id"),
+                "nick": item.get("nick"),
+                "name": item.get("name"),
+                "status": item.get("status"),
+                "when": self._fmt_time(item.get("updated_at") or item.get("created_at") or 0),
+            }
+            for item in items[:MAX_CHAT_HISTORY]
+        ]
+
+    def _send_history(self, chat_id: int) -> None:
+        rows = self._history_rows()
+        self._send(chat_id, T.history_text(self.cfg, rows), T.history_keyboard(rows) or None)
+
+    def _send_proof_to(self, chat_id: int, order_id: str) -> None:
+        order = self._find_order(order_id)
+        if not isinstance(order, dict):
+            self._send(chat_id, T.order_missing(order_id))
+            return
+
+        proofs = self._proofs(order)
+        if not proofs:
+            self._send(chat_id, T.proof_missing(order_id))
+            return
+
+        self._send(chat_id, T.proof_header(order_id, order.get("status") or ""))
+        for index, proof in enumerate(proofs):
+            self._deliver_proof(chat_id, proof, T.proof_caption(order_id, index, len(proofs)))
+
     def _on_admin_message(self, msg: dict, text: str) -> None:
         chat_id = msg["chat"]["id"]
         session = self._session(chat_id)
@@ -624,7 +763,7 @@ class BotLogic:
         self._send(chat_id, T.admin_hint())
 
     def _take_product_photo(self, chat_id: int, msg: dict, order_id: str) -> None:
-        order = self.store.orders.get(order_id)
+        order = self._find_order(order_id)
         if not isinstance(order, dict):
             self._clear_session(chat_id)
             self._send(chat_id, T.order_missing(order_id))
@@ -634,7 +773,7 @@ class BotLogic:
             self._send(chat_id, T.already_done(order_id))
             return
         if order.get("status") in ("cancelled", "rejected"):
-            # Заявку отменили, пока оператор собирался прислать фото — товар не выдаём.
+
             self._clear_session(chat_id)
             self._send(chat_id, T.already_closed(self.cfg, order_id))
             return
@@ -648,7 +787,7 @@ class BotLogic:
         order["product_text"] = (proof.get("caption") or "").strip()
         order["delivered_at"] = self._now()
         delivered = self._send_product(order)
-        self._set_status(order, "accepted", final=True)
+        self._finalize(order, "accepted")
         self._clear_session(chat_id)
         self._send(chat_id, T.product_sent(self.cfg, order_id, delivered))
         self._save()
@@ -662,7 +801,7 @@ class BotLogic:
         key = "document" if is_document else "photo"
         try:
             if text:
-                # Подпись оператора уходит как есть, без HTML-разметки.
+
                 result = self.api.call(
                     method,
                     chat_id=buyer,
@@ -692,7 +831,7 @@ class BotLogic:
             return False
 
     def _send_chat_message(self, admin_chat: int, order_id: str, msg: dict) -> None:
-        order = self.store.orders.get(order_id)
+        order = self._find_order(order_id)
         if not isinstance(order, dict):
             self._clear_session(admin_chat)
             self._send(admin_chat, T.order_missing(order_id))
@@ -712,7 +851,6 @@ class BotLogic:
             self._send(admin_chat, T.chat_failed())
 
     def _relay_buyer_reply(self, msg: dict, order_id: str) -> None:
-        """Ответ покупателя реплаем на сообщение оператора уходит операторам."""
         buyer_chat = msg["chat"]["id"]
         admins = self._admin_chat_ids()
         if not admins:
@@ -766,6 +904,9 @@ class BotLogic:
         if command == "orders":
             self._send_pending(chat_id)
             return
+        if command == "history":
+            self._send_history(chat_id)
+            return
         if command == "stats":
             self._send(chat_id, T.stats_text(self.cfg, self.store.stats(), self._admin_chat_ids()))
             return
@@ -784,7 +925,7 @@ class BotLogic:
         self._clear_session(chat_id)
 
         if step == "product" and order_id:
-            order = self.store.orders.get(order_id)
+            order = self._find_order(order_id)
             if isinstance(order, dict) and order.get("status") == "awaiting_product":
                 self._set_status(order, "pending")
                 self._send(chat_id, T.order_cancelled_accept(order_id))
