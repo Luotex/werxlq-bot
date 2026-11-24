@@ -29,20 +29,25 @@ def _defaults() -> dict:
         "counter": 1,
     }
 
+def _proof_summary(proof: dict) -> dict:
+    if not isinstance(proof, dict):
+        return {}
+    if proof.get("kind") not in ("photo", "document", "video", "text"):
+        return {}
+    kept: dict = {"kind": proof["kind"]}
+    if proof.get("file_id"):
+        kept["file_id"] = proof["file_id"]
+    if proof.get("name"):
+        kept["name"] = proof["name"]
+    if proof.get("text"):
+        kept["text"] = str(proof["text"])[:300]
+    if proof.get("caption"):
+        kept["caption"] = str(proof["caption"])[:300]
+    return kept
+
 def summary(order: dict) -> dict:
-    proof = order.get("proof") or {}
-    proof_kind = proof.get("kind")
-    kept_proof: dict = {}
-    if proof_kind in ("photo", "document", "video", "text"):
-        kept_proof = {"kind": proof_kind}
-        if proof.get("file_id"):
-            kept_proof["file_id"] = proof["file_id"]
-        if proof.get("name"):
-            kept_proof["name"] = proof["name"]
-        if proof.get("text"):
-            kept_proof["text"] = proof["text"][:300]
-        if proof.get("caption"):
-            kept_proof["caption"] = proof["caption"][:300]
+    raw = order.get("proofs") or [order.get("proof")]
+    kept_proofs = [item for item in (_proof_summary(proof) for proof in raw[:5]) if item]
 
     return {
         "id": order.get("id"),
@@ -54,8 +59,9 @@ def summary(order: dict) -> dict:
         "chat_id": order.get("chat_id"),
         "created_at": order.get("created_at"),
         "updated_at": order.get("updated_at") or order.get("created_at"),
-        "proof": kept_proof,
-        "proofs_count": len([item for item in order.get("proofs") or [] if item]) or (1 if kept_proof else 0),
+        "proof": kept_proofs[0] if kept_proofs else {},
+        "proofs": kept_proofs,
+        "proofs_count": len(kept_proofs),
     }
 
 class Store:

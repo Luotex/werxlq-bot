@@ -488,6 +488,7 @@ class BotLogic:
 
         delivered = self._notify_admins(order)
         self._send(chat_id, T.order_sent(self.cfg, order_id))
+        self._send_buyer_proof(chat_id, order)
         if not delivered:
             self._send(chat_id, T.no_admins(self.cfg))
         self._save()
@@ -579,6 +580,9 @@ class BotLogic:
             return
         if data == "status":
             self._send_status(chat_id, user)
+            return
+        if data == "myproof":
+            self._send_my_proof(chat_id, user)
             return
         if data == "cancel":
             if self._is_admin(user):
@@ -741,6 +745,37 @@ class BotLogic:
         self._send(chat_id, T.proof_header(order_id, order.get("status") or ""))
         for index, proof in enumerate(proofs):
             self._deliver_proof(chat_id, proof, T.proof_caption(order_id, index, len(proofs)))
+
+    def _send_buyer_proof(self, chat_id: int, order: dict, header: str = "") -> bool:
+        proofs = self._proofs(order)
+        if not proofs:
+            return False
+        try:
+            if header:
+                self._send(chat_id, header)
+            for index, proof in enumerate(proofs):
+                self._deliver_proof(
+                    chat_id, proof, T.proof_caption_buyer(order.get("id"), index, len(proofs))
+                )
+        except TelegramError as exc:
+            log.warning("Копия подтверждения покупателю %s не доставлена: %s", chat_id, exc)
+            return False
+        return True
+
+    def _send_my_proof(self, chat_id: int, user: dict) -> None:
+        orders = self._orders_of_user(user.get("id"))
+        if not orders:
+            self._send(chat_id, T.no_orders_yet(), T.back_keyboard())
+            return
+
+        orders.sort(
+            key=lambda item: item.get("updated_at") or item.get("created_at") or 0,
+            reverse=True,
+        )
+        latest = orders[0]
+        header = T.buyer_proof_header(latest.get("id"), latest.get("status") or "")
+        if not self._send_buyer_proof(chat_id, latest, header):
+            self._send(chat_id, T.buyer_proof_missing(), T.back_keyboard())
 
     def _on_admin_message(self, msg: dict, text: str) -> None:
         chat_id = msg["chat"]["id"]

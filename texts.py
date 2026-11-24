@@ -84,6 +84,8 @@ def help_text(cfg) -> str:
         "3. Бот покажет реквизиты — переведи оплату.\n"
         "4. Пришли подтверждение: фото чека или текст с номером перевода.\n"
         "5. Оператор проверит оплату и пришлёт материал в этот чат.\n\n"
+        "После отправки бот пришлёт тебе копию подтверждения оплаты — она останется "
+        "в чате, ею можно подтвердить заявку, если что-то пойдёт не так.\n\n"
         "Кнопки в меню:\n"
         f"• «{STATUS_BUTTON}» — на каком этапе заявка;\n"
         f"• «{CANCEL_BUTTON}» — отменить заявку, пока оператор её не взял.\n\n"
@@ -182,7 +184,30 @@ def order_sent(cfg, order_id: str) -> str:
         f"Ожидай: @{esc(cfg.admin_username)} проверит оплату и пришлёт "
         f"{esc(cfg.product) or 'заказ'} в этот чат.\n\n"
         f"Следить за заявкой: кнопка «{STATUS_BUTTON}» в меню.\n"
-        f"Передумал — «{CANCEL_BUTTON}», но только пока оператор её не взял."
+        f"Передумал — «{CANCEL_BUTTON}», но только пока оператор её не взял.\n\n"
+        "📎 Ниже — копия твоего подтверждения оплаты. Она останется в этом чате: "
+        "если что-то пойдёт не так, будет чем подтвердить заявку."
+    )
+
+
+def proof_caption_buyer(order_id: str, index: int = 0, total: int = 1) -> str:
+    suffix = f" · фото {index + 1} из {total}" if total > 1 else ""
+    return f"Твоё подтверждение оплаты · заявка #{esc(order_id)}{suffix}"
+
+
+def buyer_proof_header(order_id: str, status: str = "") -> str:
+    label = status_label({"status": status}) if status else ""
+    tail = f"\nСтатус: {label}" if label else ""
+    return (
+        f"📎 <b>Твоё подтверждение по заявке #{esc(order_id)}</b>{tail}\n\n"
+        "Копия остаётся в чате: по ней видно, что заявка оформлена и оплата отправлена."
+    )
+
+
+def buyer_proof_missing() -> str:
+    return (
+        "По этой заявке вложение не сохранилось — похоже, подтверждение было текстом.\n"
+        "Пролистай переписку выше, там есть твоё сообщение."
     )
 
 def nothing_to_send() -> str:
@@ -237,10 +262,16 @@ def status_text(cfg, order: dict, when: str, updated: str = "", total: int = 1) 
 def status_keyboard(order: dict) -> list:
     status = (order or {}).get("status", "pending")
     if status == "pending":
-        return [[btn(CANCEL_BUTTON, "cancel")], [btn("🔄 Обновить статус", "status")]]
+        return [
+            [btn("📎 Моё доказательство", "myproof"), btn(CANCEL_BUTTON, "cancel")],
+            [btn("🔄 Обновить статус", "status")],
+        ]
     if status == "awaiting_product":
-        return [[btn("🔄 Обновить статус", "status")]]
-    return [[btn(APPLY_BUTTON, "pay")]]
+        return [[btn("📎 Моё доказательство", "myproof"), btn("🔄 Обновить статус", "status")]]
+    return [
+        [btn("📎 Моё доказательство", "myproof")],
+        [btn(APPLY_BUTTON, "pay")],
+    ]
 
 def no_orders_yet() -> str:
     return f"У тебя пока нет заявок. Нажми «{APPLY_BUTTON}», чтобы создать первую."
